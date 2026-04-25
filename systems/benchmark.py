@@ -8,6 +8,11 @@ from typing import Literal
 
 import torch
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import timeit
+from basics.basics.model import BasicsTransformerLM
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -56,13 +61,27 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def build_model(config: BenchmarkConfig) -> torch.nn.Module:
-    """Instantiate the staff Basics transformer for the requested model size."""
-    raise NotImplementedError
+    """Instantiate the Basics transformer for the requested model size."""
+    spec = MODEL_SPECS[config.model_size]
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=spec.d_model,
+        num_layers=spec.num_layers,
+        num_heads=spec.num_heads,
+        d_ff=spec.d_ff,
+        rope_theta=10000.0,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    if config.compile_model:
+        model = torch.compile(model)
+    return model
 
 
 def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Tensor:
     """Construct a random token batch for benchmarking and profiling."""
-    raise NotImplementedError
+    return torch.randint(0, config.vocab_size, (config.batch_size, config.context_length), device=device, dtype=torch.long)
 
 
 def run_single_step(
@@ -72,12 +91,41 @@ def run_single_step(
     autocast_context,
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
-    raise NotImplementedError
+    with autocast_context:
+        logits = model(batch)
+        if mode in ["forward-backward", "train-step"]:
+            loss = logits.sum()  # dummy loss for backward
+            loss.backward()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
-    raise NotImplementedError
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(config)
+    model.train()  # set to train mode for gradients
+    batch = make_random_batch(config, device)
+    autocast_context = make_autocast_context(config.use_bf16)
+
+    maybe_start_memory_history(config.use_memory_profiler)
+    # Warmup
+    for _ in range(config.warmup_steps):
+        run_single_step(model, batch, config.mode, autocast_context)
+        model.zero_grad()
+
+    # Measure
+    start_time = timeit.default_timer()
+    for _ in range(config.measure_steps):
+        run_single_step(model, batch, config.mode, autocast_context)
+        model.zero_grad()
+    end_time = timeit.default_timer()
+
+    total_time = end_time - start_time
+    time_per_step = total_time / config.measure_steps
+    if config.use_memory_profiler:
+        maybe_dump_memory_snapshot(True, config.output_dir)
+    return {"time_per_step": time_per_step}
 
 
 def annotated_scaled_dot_product_attention(*args, **kwargs):
@@ -87,16 +135,20 @@ def annotated_scaled_dot_product_attention(*args, **kwargs):
 
 def maybe_start_memory_history(enabled: bool) -> None:
     if enabled:
-        raise NotImplementedError
+        # Simple: no action, could log memory
+        pass
 
 
 def maybe_dump_memory_snapshot(enabled: bool, output_path: Path) -> None:
     if enabled:
-        raise NotImplementedError
+        if torch.cuda.is_available():
+            output_path.mkdir(parents=True, exist_ok=True)
+            with open(output_path / "memory_snapshot.txt", "w") as f:
+                f.write(torch.cuda.memory_summary())
 
 
 def make_autocast_context(use_bf16: bool):
-    if use_bf16:
+    if use_bf16 and torch.cuda.is_available():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
@@ -116,7 +168,8 @@ def main() -> None:
         compile_model=args.compile_model,
         output_dir=args.output_dir,
     )
-    benchmark_model(config)
+    results = benchmark_model(config)
+    print(f"Benchmark results: {results}")
 
 
 if __name__ == "__main__":
