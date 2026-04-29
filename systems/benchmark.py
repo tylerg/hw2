@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import timeit
 from basics.basics.model import BasicsTransformerLM
 
+import torch.cuda.nvtx as nvtx
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -87,15 +89,28 @@ def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Te
 def run_single_step(
     model: torch.nn.Module,
     batch: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
     mode: Literal["forward", "forward-backward", "train-step"],
     autocast_context,
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
+    
+    optimizer.zero_grad(set_to_none=True)
+
     with autocast_context:
-        logits = model(batch)
+        with nvtx.range("forward"):
+            logits = model(batch)
+
         if mode in ["forward-backward", "train-step"]:
-            loss = logits.sum()  # dummy loss for backward
-            loss.backward()
+            loss = logits.sum()
+
+            with nvtx.range("backward"):
+                loss.backward()
+
+        if mode == "train-step":
+            with nvtx.range("optimizer-step"):
+                optimizer.step()
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -104,6 +119,7 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.train()  # set to train mode for gradients
     batch = make_random_batch(config, device)
     autocast_context = make_autocast_context(config.use_bf16)
@@ -111,14 +127,14 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     maybe_start_memory_history(config.use_memory_profiler)
     # Warmup
     for _ in range(config.warmup_steps):
-        run_single_step(model, batch, config.mode, autocast_context)
-        model.zero_grad()
+        with nvtx.range("warmup"):
+            run_single_step(model, batch, optimizer, config.mode, autocast_context)
 
     # Measure
     start_time = timeit.default_timer()
     for _ in range(config.measure_steps):
-        run_single_step(model, batch, config.mode, autocast_context)
-        model.zero_grad()
+        with nvtx.range("measure"):
+            run_single_step(model, batch, optimizer, config.mode, autocast_context)
     end_time = timeit.default_timer()
 
     total_time = end_time - start_time
